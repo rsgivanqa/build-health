@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow"><title>Build Health · як рахуємо</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fff; --ink: #1f2328; --muted: #59636e; --line: #d1d9e0; --code: #f6f8fa; --link: #0969da; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --ink: #e6edf3; --muted: #9198a1; --line: #3d444d; --code: #151b23; --link: #4493f8; } }
+  body { background: var(--bg); color: var(--ink); font: 15px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; }
+  a { color: var(--link); } h1, h2 { border-bottom: 1px solid var(--line); padding-bottom: .3em; }
+  code, pre { background: var(--code); border-radius: 6px; font-size: 13px; } code { padding: .15em .35em; } pre { padding: 12px; overflow-x: auto; }
+  table { border-collapse: collapse; display: block; overflow-x: auto; } th, td { border: 1px solid var(--line); padding: 6px 10px; vertical-align: top; }
+  .back { color: var(--muted); font-size: 13px; }
+</style></head>
+<body><main><a class="back" href="./">← до дашборду</a>
+<h1>Метрики Game Health — рішення після незалежного ревю (2026-10-13, v3: прод-білди, архів)</h1>
+<p>Процес: незалежний агент без доступу до наших висновків зібрав набір метрик з нуля за індустріальною практикою; потім кожну перевірено на реальних даних (Grafana/ClickHouse/Postgres/Loki, Unity, GA). Нижче — що прийнято, що відкинуто і чому. Список із синку 13.10 («DAU, % помилок, час/retention, девайси, завантаження») <strong>як головні сигнали не підходить</strong> — обґрунтування в §3.</p>
+<p><strong>Вісь порівняння (v3, 13.10):</strong> <strong>прод-білд проти попереднього прод-білда</strong>, обидва за однакову фазу життя — перші <code class="notranslate">min(вік поточного, 7 днів)</code> від першої релізної сесії. Прод = <code class="notranslate">build_kind = release</code> і ≥ 100 унікальних гравців за перші 7 днів (тестові білди команди — до ~25 гравців, прод — від ~700; ручні винятки — <code class="notranslate">data/prod_builds.json</code>). На сторінці лише прод-білди. Dev/debug/unknown-сесії виключені.</p>
+<p>Історія (v1 → v3): v1 — спільне календарне вікно і медіана 3 попередніх білдів (новий білд порівнювався з «хвостом» старих, у базу потрапляли старі гілки 0.4.x); v2 — однакова фаза життя, база з тієї ж лінії; v3 — один попередній прод-білд, лише прод-білди, розрахунок з локального архіву.</p>
+<p><strong>Архів (v3).</strong> Postgres і Loki в Grafana зберігають ~15 днів, тому все потрібне копіюється в <code class="notranslate">store/archive.db</code> (<code class="notranslate">collectors/archive.py</code>, запускається з <code class="notranslate">kpi.py</code>). Порівняння з білдом, що вийшов до старту подій (29.09), для S1/S2/часу до гри неможливе — сторінка каже «немає з чим порівняти».</p>
+<p><strong>Unity групує NRE.</strong> Усі NullReferenceException, кинуті через рушій (<code class="notranslate">UnityEngine.Bindings.ThrowHelper</code>), Unity Cloud Diagnostics складає в одну проблему (<code class="notranslate">9bf682b4</code>, тег Fixed, 1 102 гравці на 0.5.2), тож LiftLever, MetaSkinPreviewRig та інші NRE в Unity окремо не видно, а тег Fixed на цій проблемі нічого не означає. Окремі сигнатури — лише з Loki.</p>
+<h2>1. Сигнальні показники (три, з порогами)</h2>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>#</th>
+<th>Метрика</th>
+<th>Формула (поля)</th>
+<th>Джерело</th>
+<th>Поріг</th>
+<th>Стан 13.10 (0.5.2 vs 0.5.0)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>S1</strong></td>
+<td><strong>Crash-free launches %</strong></td>
+<td>1 − <code class="notranslate">previous_exit.kind ∈ {unclean, quit_stalled}</code> / усі <code class="notranslate">previous_exit</code> білда. Подія пишеться при наступному запуску й каже, як завершився попередній. Деталізація: <code class="notranslate">phase</code> (PreSession / Lobby / InSession). Звірка: Unity Cloud Diagnostics <code class="notranslate">crashes_count</code> + <code class="notranslate">users_affected</code> по версії</td>
+<td><code class="notranslate">telemetry_events</code> (<code class="notranslate">previous_exit</code>), Unity</td>
+<td>🟡 −0.5 п.п. від бази · 🔴 −1 п.п. або новий краш ≥3 % користувачів білда · сірий при N &lt; 300</td>
+<td>98.2 % vs 97.6 % (перші 3.9 дн.)</td>
+</tr>
+<tr>
+<td><strong>S2</strong></td>
+<td><strong>Обриви з'єднання</strong></td>
+<td><code class="notranslate">session:end:Disconnect:*</code> / (<code class="notranslate">Normal</code> + <code class="notranslate">Disconnect</code>). <strong>AltF4 у знаменник не йде</strong>: у коді (<code class="notranslate">SessionEndAnalyticsSystem</code>) це <code class="notranslate">Application.quitting</code> у меню з порожнім <code class="notranslate">session_id</code> — вихід із гри, а не кінець сесії (до v2 він займав ~25 % знаменника і занижував показник з ~23 % до ~16 %). Розбивка соло / кооп — через <code class="notranslate">session_id</code> → <code class="notranslate">session_summaries.player_count</code>; окремо частка обривів у Lobby / Loading. Пам'ятати: <code class="notranslate">Normal</code> включає Kicked і Recovery, <code class="notranslate">Disconnect</code> — усе, чию причину гра не знає. Поле <code class="notranslate">disconnects</code> у <code class="notranslate">session_summaries</code> <strong>завжди 0 — не використовувати</strong></td>
+<td><code class="notranslate">telemetry_events</code> + <code class="notranslate">session_summaries</code></td>
+<td>🟡 +25 % відносно бази · 🔴 +50 %</td>
+<td>22.8 % vs 22.5 % (перші 3.9 дн.); соло 9.8 vs 11.8, кооп 20.7 vs 22.6</td>
+</tr>
+<tr>
+<td><strong>S3</strong></td>
+<td><strong>Hitch-rate по залізу</strong></td>
+<td><code class="notranslate">Σseconds_hitch_30 / Σseconds_steady</code> окремо для кожного <code class="notranslate">hw_tier</code> (ultra/high/mid/low); загальна цифра лише довідково, бо мікс заліза між білдами гуляє. Поруч — медіана <code class="notranslate">fps_p10</code></td>
+<td><code class="notranslate">session_level_perf</code></td>
+<td>🟡 +20 % відносно бази для того ж tier · 🔴 +40 % або <code class="notranslate">fps_p10</code> медіана впала &gt;15 %</td>
+<td>mid 31.7 vs 29.0 (+9 %), high 15.8 vs 15.2, ultra 5.6 vs 6.6 (перші 3.9 дн.)</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p>Правило: будь-який 🔴 → білд нездоровий. Кожна плитка показує N, інтервал Вільсона 95 % і стрілку проти бази. Плитка S3 показує групу заліза з найгіршим станом відносно бази (не найчисельнішу); база по групі — лише з білдів, де в цій групі ≥ 300 відвідувань рівнів.</p>
+<h2>2. Деталізація (куди дивитись, коли червоно)</h2>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>Метрика</th>
+<th>Формула</th>
+<th>Джерело</th>
+<th>Навіщо</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Сигнатури exception (точно)</td>
+<td>сигнатура = тип + перший кадр з неймспейсів гри (<code class="notranslate">Features</code>, <code class="notranslate">Global</code>, <code class="notranslate">NetworkServices</code>…), витягується <code class="notranslate">regexp</code> прямо в LogQL; <code class="notranslate">sum by (etype, frame)</code> по рядках, гравцях (<code class="notranslate">player_id</code>) і сесіях (<code class="notranslate">session_id</code>) за ті самі перші дні білда. <strong>Без вибірки</strong> (у v1 — 25 зрізів × 200 рядків: LiftLever показував 8 гравців замість 638)</td>
+<td>Loki</td>
+<td>що реально чіпає людей; сортування за гравцями</td>
+</tr>
+<tr>
+<td>Нові сигнатури</td>
+<td>«нова» = не було в жодному з 3 попередніх білдів лінії за всю історію, що ще зберігає Loki (~2 тижні)</td>
+<td>Loki</td>
+<td>регресії коду</td>
+</tr>
+<tr>
+<td>Частка гравців з помилкою</td>
+<td>гравці з ≥1 exception / гравці білда за ті самі перші дні, проти бази</td>
+<td>Loki + <code class="notranslate">session_summaries</code></td>
+<td>ріст = прапорець</td>
+</tr>
+<tr>
+<td>Статус сигнатури</td>
+<td>тег Unity (лише за кадром гри, не рушія); тікети: ручні з <code class="notranslate">data/links.json</code> — точні, автопідбір за класом — кандидати «BAR-x?» без скасованих і дублікатів</td>
+<td>Unity + Linear</td>
+<td>«Fixed / Done, але триває» = реопен</td>
+</tr>
+<tr>
+<td>Early-quit %</td>
+<td>сесії з <code class="notranslate">0 &lt; duration_s &lt; 300</code> / сесії з <code class="notranslate">duration_s &gt; 0</code></td>
+<td><code class="notranslate">session_summaries</code></td>
+<td>зламаний старт (меню, лоадінг, інпут)</td>
+</tr>
+<tr>
+<td>Час до геймплею</td>
+<td><code class="notranslate">min(session_time_ms)</code> першого <code class="notranslate">gameplay_scene_loaded</code> (не SessionCoreScene) p50 / p95</td>
+<td><code class="notranslate">telemetry_events</code></td>
+<td>«завантаження» з синку у вимірному вигляді</td>
+</tr>
+<tr>
+<td>Пінг</td>
+<td><code class="notranslate">avg_ping_ms</code> p50 / p95 по region</td>
+<td><code class="notranslate">session_summaries</code></td>
+<td>відрізнити мережу від коду при S2</td>
+</tr>
+<tr>
+<td>Join-воронка</td>
+<td><code class="notranslate">JoinConfirm</code> → <code class="notranslate">matchmaking:join:success</code> / <code class="notranslate">late_join_refused</code> / <code class="notranslate">connect_failed</code> (reason)</td>
+<td><code class="notranslate">telemetry_events</code></td>
+<td>де саме ламається приєднання</td>
+</tr>
+<tr>
+<td>Перф по рівнях × tier</td>
+<td><code class="notranslate">main_thread_ms_p95</code>, <code class="notranslate">gpu_ms_p95</code>, <code class="notranslate">seconds_cpu_bound / gpu_bound</code>, <code class="notranslate">fps_p01</code></td>
+<td><code class="notranslate">session_level_perf</code></td>
+<td>куди саме впав S3</td>
+</tr>
+<tr>
+<td>RAM-тренд</td>
+<td><code class="notranslate">process_ram_mb_p95</code> по рівнях і порядку відвідання</td>
+<td><code class="notranslate">session_level_perf</code></td>
+<td>витік = передвісник крашів на 2-й годині</td>
+</tr>
+<tr>
+<td>Воронка рівнів</td>
+<td><code class="notranslate">level_exit</code> за reason і медіана <code class="notranslate">time_in_level</code> per level</td>
+<td><code class="notranslate">telemetry_events</code></td>
+<td>софтлок/баланс на конкретному рівні</td>
+</tr>
+<tr>
+<td>Host loss</td>
+<td>у мультиплеєрній сесії всі <code class="notranslate">player_count − 1</code> гравців отримали Disconnect у вікні 5 с</td>
+<td><code class="notranslate">telemetry_events</code> + <code class="notranslate">session_summaries.host_player_id</code></td>
+<td>«хост упав» окремо від «клієнт відвалився»</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p>Контекст (не сигнал, окремий рядок): DAU, нові гравці, retention D1 (GA), негативні Steam-рев'ю за 7 днів.</p>
+<p><strong>Стан даних</strong> (окремий розділ): свіжість ClickHouse / Postgres / Loki і ручних знімків Unity / GA, межі історії (події з 29.09, Loki ~2 тижні), частка сесій без версії / <code class="notranslate">unknown</code> за 7 дн. (&gt; 5 % — спершу лагодити телеметрію), старі білди, які досі грають (0.4.x — що це за гілка Steam, уточнити).</p>
+<h2>2a. Прапорці у вердикті (жовті, без порогів сигналів)</h2>
+<p>Сигнали S1–S3 не бачать частини проблем, тому вердикт стає «є що перевірити» (жовтий), коли:</p>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>Прапорець</th>
+<th>Умова</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Нові помилки</td>
+<td>нова сигнатура в ≥ 10 гравців або ≥ 1 % гравців білда</td>
+</tr>
+<tr>
+<td>Ріст помилок</td>
+<td>частка гравців з exception +25 % і більше відносно бази за ті самі перші дні</td>
+</tr>
+<tr>
+<td>Застрягання</td>
+<td>≥ 3 Unity User Reports по білду з stuck / застряг / softlock / under map / preso… — софтлоки не видно ні в крашах, ні в обривах</td>
+</tr>
+<tr>
+<td>Нативні краші</td>
+<td>Unity: гравці з крашем на 1000 активних гравців за 7 дн. ≥ 1.5× попереднього білда і ≥ 10 крашів (інакше — «до відома»)</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p>«До відома» (сірі): білду &lt; 48 год (S1 ще доповнюється, бо краш видно при наступному запуску); база лише з одного білда; база з іншої лінії.</p>
+<h2>3. Що відкинуто і чому</h2>
+<ul>
+<li><strong>DAU / retention / playtime як health</strong> — продуктові, з лагом у добу-тиждень, реагують на фічеринг Steam, вихідні, стрімерів. Падіння DAU не каже, куди дивитись. Лишаємо як контекст.</li>
+<li><strong>«% помилок»</strong> — без чисельника і знаменника не метрика; при флуді NRE щокадру ~100 % сесій «з помилкою» в кожному білді. Замінено на сигнатури + сесії/користувачі affected.</li>
+<li><strong><code class="notranslate">error_count</code> / сирий count exception</strong> — безглуздий при флуді (1 млн на день ≠ 1 млн проблем).</li>
+<li><strong>«Девайси / specs»</strong> — це розріз (<code class="notranslate">hw_tier</code>, <code class="notranslate">gpu_name</code>), а не метрика; залізо не стає гіршим від білда.</li>
+<li><strong>Тривалість сесії</strong> — залежить від контенту (новий рівень → довше). Лишаємо лише early-quit.</li>
+<li><strong>GA SDK-помилки</strong> — без стеків, дублюють Loki гірше.</li>
+<li><strong>Unity «кількість проблем»</strong> для крашів — без символів один баг = багато «проблем» по адресах; рахуємо краші по користувачах/запусках.</li>
+</ul>
+<h2>4. Поправки до ревю після перевірки на даних</h2>
+<ul>
+<li>Роль host/client <strong>є</strong>: <code class="notranslate">session_level_perf.is_host</code> і <code class="notranslate">session_summaries.host_player_id</code> (ревю вважало, що немає).</li>
+<li>Крашів через «відсутній session_end» не рахуємо: кінець сесії мережевий, <code class="notranslate">duration_s = 0</code> лише у 1.5 % сесій. Натомість є готовий маркер <code class="notranslate">previous_exit</code> (quit / unclean / quit_stalled) — він і став S1.</li>
+<li><code class="notranslate">disconnects</code> у <code class="notranslate">session_summaries</code> = 0 у всіх 7 000 сесій → поле мертве, S2 рахуємо з івентів <code class="notranslate">session:end:Disconnect:*</code>.</li>
+<li><code class="notranslate">connect_failed</code> пишеться без <code class="notranslate">session_id</code> (усі 61 у «сесії» з порожнім id) — рахувати по <code class="notranslate">app_version</code>, не по сесіях.</li>
+<li>Dev-сесії: <code class="notranslate">build_kind</code> достатньо (release/debug), але allow-list Steam ID команди ще треба зібрати. Перевірено 13.10: debug-білди мають інші рядки <code class="notranslate">app_version</code>, у релізні S1/S2 не потрапляють.</li>
+<li><strong>Сесія = рядок <code class="notranslate">session_summaries</code></strong>, а не рядок гравця. У v1 <code class="notranslate">count()</code> стояв поруч з <code class="notranslate">arrayJoin(player_ids)</code> → «сесій» і всі сесійні частки рахувались по гравцях (0.5.2: 3 895 «сесій» замість 2 526; кооп 57 % замість 34 %).</li>
+<li><code class="notranslate">previous_exit</code> бере <code class="notranslate">app_version</code> попереднього запуску з PlayerPrefs — краш записується на правильний білд, навіть якщо гравець після нього оновився.</li>
+</ul>
+<h2>5. Пастки → як показано на дашборді</h2>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>Пастка</th>
+<th>На дашборді</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Мала вибірка (перші години білда 50–150 сесій, 1 краш = 1 п.п.)</td>
+<td>N + інтервал Вільсона; сигнал сірий до N ≥ 300</td>
+</tr>
+<tr>
+<td>Перші години: Steam оновлює стагговано, перші гравці — ядро на кращому залізі</td>
+<td>база — ті самі перші години попередніх білдів (однакова фаза життя)</td>
+</tr>
+<tr>
+<td>Білд проти «хвоста» старого (у v1 спільне календарне вікно)</td>
+<td>період = «перші N днів після виходу» для кожного білда окремо</td>
+</tr>
+<tr>
+<td>День тижня (вихідні: більше сесій, інший склад)</td>
+<td>частка сесій у вихідні показана поруч із базою</td>
+</tr>
+<tr>
+<td>Старі гілки з іншою телеметрією (0.4.x досі грають, без <code class="notranslate">previous_exit</code>)</td>
+<td>база лише з тієї ж лінії <code class="notranslate">major.minor</code>; S1/S2/TTG — лише з білдів, що вийшли після старту подій</td>
+</tr>
+<tr>
+<td>Краш видно лише при наступному запуску; хто не повернувся — невидимий</td>
+<td>прапорець «до відома» для білдів &lt; 48 год; звірка з нативними крашами Unity</td>
+</tr>
+<tr>
+<td>Зовнішні апдейти (Steam, драйвери, Photon) зсувають усі білди разом</td>
+<td>якщо погіршення й на попередньому білді, що ще в ходу, — це не білд</td>
+</tr>
+<tr>
+<td>Контентна зміна (новий рівень)</td>
+<td>перф лише per level × tier</td>
+</tr>
+<tr>
+<td>Cloud Diagnostics без символів</td>
+<td>краші по користувачах/запусках, символи — action-item</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<h2>6. Групи заліза (hw_tier) — як визначаються (перевірено 13.10 на архіві)</h2>
+<p>Поле <code class="notranslate">hw_tier</code> у <code class="notranslate">session_level_perf</code> ставить <strong>бекенд телеметрії</strong> (інжест/фіналізатор, не в репо гри); клієнт шле лише <code class="notranslate">graphics_memory_mb = SystemInfo.graphicsMemorySize</code>. Емпірично за 14 днів релізних сесій межі збігаються з обсягом відеопам'яті й більше ні з чим (ядра CPU перетинаються між групами):</p>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>Група</th>
+<th>VRAM</th>
+<th>Типові GPU</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>low (слабке)</td>
+<td>&lt; 2 ГБ</td>
+<td>GTX 1050, GTX 950, GT 1030, MX570</td>
+</tr>
+<tr>
+<td>mid (середнє)</td>
+<td>2–5 ГБ</td>
+<td>GTX 1650, RTX 3050 Laptop, GTX 1050 Ti, інтегровані AMD</td>
+</tr>
+<tr>
+<td>high (потужне)</td>
+<td>5–11 ГБ</td>
+<td>RTX 4060, 5060, 3070, 3060 Ti</td>
+</tr>
+<tr>
+<td>ultra (топове)</td>
+<td>≥ 11 ГБ</td>
+<td>RTX 3060 12 ГБ, 5070, 5080, 4070</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p>Наслідок: групи — про пам'ять, а не про швидкість: RTX 3060 12 ГБ рахується «топовим», а швидший RTX 3070 8 ГБ — «потужним». Для порівняння білда з білдом це не заважає (мікс однаковий в обох), але підписи «топове/потужне» не варто читати як «швидке/повільне». Точне правило — спитати у Дмитра (бекенд).</p>
+</main></body></html>
